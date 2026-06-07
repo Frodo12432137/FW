@@ -65,6 +65,7 @@ REPLACE_DICT = {
     "Zalesie": "ZAL",
     "Żuromin": "ZUR",
 }
+REV_REPLACE = {value: key for key, value in REPLACE_DICT.items()}
 
 ROLLING_FEATURES_15MIN = [
     ("kierunekWiatru", "kierunek_srednia16", 90),
@@ -351,6 +352,76 @@ def normalize_angle(value):
     return (value % 360 + 360) % 360
 
 
+def make_laczenie_like_output(output_dir: Path) -> Path | None:
+    frames = {}
+    for target_name, cfg in TARGETS.items():
+        path = output_dir / target_name / "predictions.csv"
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        keep_cols = ["dataGodzinaCET", "lokalizacja", cfg["prediction_col"]]
+        existing = [col for col in keep_cols if col in df.columns]
+        frames[target_name] = df[existing].copy()
+
+    if not frames:
+        return None
+
+    merged = None
+    for df in frames.values():
+        if merged is None:
+            merged = df
+        else:
+            merged = merged.merge(df, on=["dataGodzinaCET", "lokalizacja"], how="outer")
+
+    merged["dataGodzinaCET"] = pd.to_datetime(merged["dataGodzinaCET"], errors="coerce")
+    cet = merged["dataGodzinaCET"]
+    try:
+        merged["dataGodzinaUTC"] = (
+            cet.dt.tz_localize("Europe/Warsaw", ambiguous="infer", nonexistent="shift_forward")
+            .dt.tz_convert("UTC")
+        )
+    except Exception:
+        merged["dataGodzinaUTC"] = (
+            cet.dt.tz_localize("Europe/Warsaw", ambiguous="NaT", nonexistent="NaT")
+            .dt.tz_convert("UTC")
+        )
+
+    merged["lokalizacje"] = merged["lokalizacja"].map(REV_REPLACE).fillna(merged["lokalizacja"])
+    merged["data_wykonania"] = pd.Timestamp.now(tz="UTC")
+    merged["execId"] = pd.NA
+    merged["czasDanychZrodlaCET"] = pd.NaT
+    merged["czasDanychZrodlaUTC"] = pd.NaT
+    merged["idPunkt"] = pd.NA
+
+    file_time = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
+    basename = f"backtest_prognoza_wiatr_korekta_{file_time}"
+    merged["plik"] = basename
+
+    final_cols = [
+        "dataGodzinaCET",
+        "dataGodzinaUTC",
+        "lokalizacja",
+        "lokalizacje",
+        "skorygowana_predkoscWiatru",
+        "skorygowana_temperatura",
+        "skorygowana_kierunek",
+        "data_wykonania",
+        "execId",
+        "czasDanychZrodlaCET",
+        "czasDanychZrodlaUTC",
+        "idPunkt",
+        "plik",
+    ]
+    for col in final_cols:
+        if col not in merged.columns:
+            merged[col] = pd.NA
+
+    final = merged[final_cols].sort_values(["lokalizacja", "dataGodzinaCET"])
+    output_path = output_dir / f"{basename}.csv"
+    final.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
 def train_fold(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -599,14 +670,18 @@ def main():
 
     summary_df = pd.DataFrame(summaries)
     summary_df.to_csv(Path(args.output_dir) / "summary.csv", index=False)
+    laczenie_like_path = make_laczenie_like_output(Path(args.output_dir))
     run_meta = {
         "started_at": started_at,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "args": vars(args),
         "summaries": summaries,
+        "laczenie_like_csv": str(laczenie_like_path) if laczenie_like_path else None,
     }
     (Path(args.output_dir) / "run_metadata.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(summary_df.to_string(index=False))
+    if laczenie_like_path:
+        print(f"Zapisano CSV jak po laczenie.py: {laczenie_like_path}")
 
 
 if __name__ == "__main__":

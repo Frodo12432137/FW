@@ -68,6 +68,7 @@ python backtest_models.py ^
 Wyniki zapisują się w `backtest_artifacts/`:
 
 - `summary.csv` - średnie wyniki dla każdego targetu,
+- `backtest_prognoza_wiatr_korekta_YYYYMMDD_HHMMSS.csv` - jeden scalony CSV w układzie podobnym do wyjścia `laczenie.py`,
 - `{target}/metrics_by_fold.csv` - metryki per fold,
 - `{target}/predictions.csv` - predykcje i wartości rzeczywiste,
 - `{target}/fold_XXX/` - artefakty modelu, scaler i lista cech dla konkretnego folda.
@@ -79,6 +80,14 @@ Najważniejsze kolumny:
 - `baseline_mae`, `baseline_rmse` - błąd surowej prognozy,
 - `corrected_mae`, `corrected_rmse` - błąd po korekcie modelu,
 - `improvement_mae_pct`, `improvement_rmse_pct` - poprawa procentowa; wartości dodatnie oznaczają, że korekta pomaga.
+
+Scalony plik `backtest_prognoza_wiatr_korekta_*.csv` ma kolumny:
+
+```text
+dataGodzinaCET, dataGodzinaUTC, lokalizacja, lokalizacje,
+skorygowana_predkoscWiatru, skorygowana_temperatura, skorygowana_kierunek,
+data_wykonania, execId, czasDanychZrodlaCET, czasDanychZrodlaUTC, idPunkt, plik
+```
 
 ## Uwaga metodologiczna
 
