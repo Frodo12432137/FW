@@ -72,6 +72,8 @@ Wyniki zapisują się w `backtest_artifacts/`:
 - `{target}/predictions.csv` - predykcje i wartości rzeczywiste,
 - `{target}/fold_XXX/` - artefakty modelu, scaler i lista cech dla konkretnego folda.
 
+Katalogi `Predkosc/artifacts/`, `Temperatura/artifacts/`, `Kierunek/artifacts/` i `backtest_artifacts/` są trzymane w repo przez pliki `.gitkeep`, żeby po sklonowaniu od razu istniały. Właściwe modele i wyniki zapiszą się do nich dopiero po uruchomieniu treningu albo backtestu.
+
 Najważniejsze kolumny:
 
 - `baseline_mae`, `baseline_rmse` - błąd surowej prognozy,
