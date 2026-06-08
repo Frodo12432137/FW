@@ -375,6 +375,9 @@ def make_laczenie_like_output(output_dir: Path, targets: list[str] | None = None
         else:
             merged = merged.merge(df, on=["dataGodzinaCET", "lokalizacja"], how="outer")
 
+    if "skorygowana_kierunek" not in merged.columns and "skorygowany_kierunekWiatru" in merged.columns:
+        merged["skorygowana_kierunek"] = merged["skorygowany_kierunekWiatru"]
+
     merged["dataGodzinaCET"] = pd.to_datetime(merged["dataGodzinaCET"], errors="coerce")
     cet = merged["dataGodzinaCET"]
     try:
@@ -786,6 +789,11 @@ def parse_args():
         default="fit_all_csv",
         help="fit_all_csv robi szybki CSV z calego okresu SQL; walk_forward robi pelny backtest z wieloma foldami.",
     )
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Nie trenuje modeli; tylko scala istniejace {target}/predictions.csv do finalnego CSV jak po laczenie.py.",
+    )
     parser.add_argument("--targets", nargs="+", default=["predkosc", "temperatura", "kierunek"], choices=sorted(TARGETS))
     parser.add_argument("--start-date", default=None, help="Np. 2024-01-01 00:00:00. Podmienia @start_date w SQL.")
     parser.add_argument("--end-date", default=None, help="Np. 2026-05-31 23:45:00. Podmienia @end_date w SQL.")
@@ -813,6 +821,14 @@ def parse_args():
 def main():
     args = parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.merge_only:
+        laczenie_like_path = make_laczenie_like_output(Path(args.output_dir), targets=args.targets)
+        if not laczenie_like_path:
+            raise RuntimeError(f"Nie znaleziono predictions.csv w {args.output_dir}.")
+        print(f"Zapisano CSV jak po laczenie.py: {laczenie_like_path}")
+        return
+
     torch.manual_seed(42)
     np.random.seed(42)
 

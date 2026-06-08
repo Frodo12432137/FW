@@ -22,6 +22,16 @@ targets: predkosc, temperatura, kierunek
 
 Ten tryb nie robi kilkunastu foldow. Trenuje kazdy model raz i zapisuje scalony CSV z calego wspolnego okresu SQL.
 
+## Ponowne scalenie bez treningu
+
+Jesli modele juz sie policzyly i chcesz tylko odtworzyc finalny CSV z istniejacych plikow `{target}/predictions.csv`, uzyj:
+
+```bash
+python backtest_models.py --merge-only
+```
+
+To nie pobiera danych z SQL i nie trenuje modeli. Tworzy tylko nowy plik `backtest_prognoza_wiatr_korekta_*.csv`.
+
 ## Instalacja
 
 ```bash
