@@ -8,7 +8,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyodbc
+
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -77,8 +81,38 @@ TARGETS = {
     },
 }
 
+ID_PUNKT_BY_LOCATION = {
+    "LOS": 31378,
+    "KAR": 31372,
+    "MAL": 31380,
+    "KIS": 31374,
+    "GAL": 31370,
+    "RES": 31382,
+    "WOJ": 31387,
+    "PEL": 31381,
+    "ZUR": 31389,
+    "KAM": 31371,
+    "LOT": 31379,
+    "RES2": 31383,
+    "KRW": 31377,
+    "KIS2": 31375,
+    "KAR2": 31373,
+    "RYB": 31384,
+    "STA": 31386,
+    "SKO": 31385,
+    "ZAL": 31388,
+    "DZW": 31524,
+}
+
+SPEED_BINS = list(range(0, 38, 2))
+DIRECTION_BINS = list(range(0, 361, 20))
+TEMPERATURE_BINS = list(range(-32, 40, 4))
+
 
 def query2df(sql_path: Path, connection_string: str, start_date: str | None, end_date: str | None) -> pd.DataFrame:
+    if pyodbc is None:
+        raise ImportError("Brak pakietu pyodbc. Zainstaluj go albo uzyj --prognoza-csv i --wykonanie-csv.")
+
     sql = sql_path.read_text(encoding="utf-8")
 
     if start_date:
@@ -198,6 +232,24 @@ def angle_diff(actual: pd.Series, forecast: pd.Series) -> pd.Series:
     return (actual - forecast + 180) % 360 - 180
 
 
+def floor_to_bin(series: pd.Series, step: int, min_value: int, max_value: int) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    binned = np.floor(values / step) * step
+    binned = binned.clip(lower=min_value, upper=max_value)
+    return binned.astype("Int64")
+
+
+def add_value_bins(joined: pd.DataFrame) -> pd.DataFrame:
+    df = joined.copy()
+    df["poziom_wietrznosci"] = floor_to_bin(df["predkoscWiatru"], step=2, min_value=0, max_value=36)
+    df["poziom_temperatury"] = floor_to_bin(df["temperatura"], step=4, min_value=-32, max_value=36)
+    direction = pd.to_numeric(df["kierunekWiatru"], errors="coerce") % 360
+    df["poziom_kierunku"] = floor_to_bin(direction, step=20, min_value=0, max_value=360)
+    df.loc[pd.to_numeric(df["kierunekWiatru"], errors="coerce") == 360, "poziom_kierunku"] = 360
+    df["idPunkt"] = df["lokalizacja"].map(ID_PUNKT_BY_LOCATION).astype("Int64")
+    return df
+
+
 def regression_params(forecast: pd.Series, actual: pd.Series) -> dict[str, float]:
     x = pd.to_numeric(forecast, errors="coerce")
     y = pd.to_numeric(actual, errors="coerce")
@@ -252,6 +304,114 @@ def summarize_group(group: pd.DataFrame, target_name: str) -> dict[str, float | 
     }
 
 
+def summarize_error(group: pd.DataFrame, target_name: str) -> dict[str, float | int | str]:
+    summary = summarize_group(group, target_name)
+    return {
+        "target": target_name,
+        "liczba_obserwacji": summary["liczba_obserwacji"],
+        "bias": summary["roznica_srednia"],
+        "mae": summary["mae"],
+        "rmse": summary["rmse"],
+        "prognoza_srednia": summary["prognoza_srednia"],
+        "wykonanie_srednia": summary["wykonanie_srednia"],
+    }
+
+
+def build_value_level_coefficients(joined: pd.DataFrame, min_count: int) -> dict[str, pd.DataFrame]:
+    df = add_value_bins(joined)
+    specs = {
+        "predkosc": {
+            "bin_col": "poziom_wietrznosci",
+            "bins": SPEED_BINS,
+            "coefficient_col": "wsp_v",
+            "coefficient_source": "wspolczynnik_mnoznik_srednich",
+        },
+        "kierunek": {
+            "bin_col": "poziom_kierunku",
+            "bins": DIRECTION_BINS,
+            "coefficient_col": "wsp_k",
+            "coefficient_source": "roznica_srednia",
+        },
+        "temperatura": {
+            "bin_col": "poziom_temperatury",
+            "bins": TEMPERATURE_BINS,
+            "coefficient_col": "wsp_t",
+            "coefficient_source": "roznica_srednia",
+        },
+    }
+
+    outputs = {}
+    for target_name, spec in specs.items():
+        records = []
+        group_cols = ["idPunkt", "lokalizacja", spec["bin_col"]]
+        for keys, group in df.groupby(group_cols, dropna=False):
+            base = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+            summary = summarize_group(group, target_name)
+            coefficient = summary[spec["coefficient_source"]]
+            records.append(
+                {
+                    **base,
+                    "target": target_name,
+                    spec["coefficient_col"]: coefficient,
+                    **summary,
+                }
+            )
+
+        long_df = pd.DataFrame(records)
+        if long_df.empty:
+            outputs[f"{target_name}_long"] = long_df
+            outputs[f"{target_name}_wide"] = long_df
+            continue
+
+        long_df = long_df[long_df["liczba_obserwacji"] >= min_count].copy()
+        long_df = long_df.sort_values(["idPunkt", spec["bin_col"]]).reset_index(drop=True)
+        long_df["p"] = long_df[spec["bin_col"]]
+
+        wide_df = long_df.pivot_table(
+            index=["idPunkt", "lokalizacja"],
+            columns=spec["bin_col"],
+            values=spec["coefficient_col"],
+            aggfunc="first",
+        )
+        wide_df = wide_df.reindex(columns=spec["bins"])
+        wide_df = wide_df.reset_index().sort_values(["idPunkt", "lokalizacja"]).reset_index(drop=True)
+        wide_df.columns = [str(c) if isinstance(c, (int, np.integer)) else c for c in wide_df.columns]
+
+        outputs[f"{target_name}_long"] = long_df
+        outputs[f"{target_name}_wide"] = wide_df
+
+    return outputs
+
+
+def build_forecast_error_report(joined: pd.DataFrame, min_count: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    location_records = []
+    for location, group in joined.groupby("lokalizacja", dropna=False):
+        for target_name in TARGETS:
+            location_records.append(
+                {
+                    "lokalizacja": location,
+                    "idPunkt": ID_PUNKT_BY_LOCATION.get(location, pd.NA),
+                    **summarize_error(group, target_name),
+                }
+            )
+
+    overall_records = []
+    for target_name in TARGETS:
+        overall_records.append(
+            {
+                "lokalizacja": "ALL",
+                "idPunkt": pd.NA,
+                **summarize_error(joined, target_name),
+            }
+        )
+
+    by_location = pd.DataFrame(location_records)
+    overall = pd.DataFrame(overall_records)
+    by_location = by_location[by_location["liczba_obserwacji"] >= min_count].copy()
+    by_location = by_location.sort_values(["target", "lokalizacja"]).reset_index(drop=True)
+    return by_location, overall
+
+
 def build_coefficients(joined: pd.DataFrame, group_mode: str, min_count: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     if group_mode == "month_of_year":
         group_cols = ["miesiac", "lokalizacja", "godzina"]
@@ -301,7 +461,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Wylicza parametry roznicy prognoza vs wykonanie per miesiac, lokalizacja i godzina."
     )
-    parser.add_argument("--start-date", default=None, help="Np. 2024-11-01 00:00:00.")
+    parser.add_argument("--start-date", default="2025-08-01 00:00:00", help="Domyslnie od sierpnia 2025, zgodnie z mailem.")
     parser.add_argument("--end-date", default=None, help="Np. 2026-10-30 23:45:00.")
     parser.add_argument("--sql-prognoza", default=str(SQL_PROGNOZA_PATH))
     parser.add_argument("--sql-wykonanie", default=str(SQL_WYKONANIE_PATH))
@@ -311,6 +471,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wykonanie-csv", default=None, help="Opcjonalnie: CSV zamiast SQL dla wykonania.")
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
     parser.add_argument("--group-mode", choices=["month_of_year", "year_month"], default="month_of_year")
+    parser.add_argument(
+        "--legacy-time-groups",
+        action="store_true",
+        help="Dodatkowo zapisuje stary uklad miesiac/lokalizacja/godzina.",
+    )
     parser.add_argument("--min-count", type=int, default=10, help="Minimalna liczba obserwacji w grupie.")
     parser.add_argument("--use-15min", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -323,35 +488,54 @@ def main() -> None:
 
     prognoza, wykonanie = load_source_data(args)
     joined = prepare_joined_data(prognoza, wykonanie, args.use_15min)
-    long_df, wide_df = build_coefficients(joined, args.group_mode, args.min_count)
+    value_level_outputs = build_value_level_coefficients(joined, args.min_count)
+    error_by_location, error_overall = build_forecast_error_report(joined, args.min_count)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    long_path = output_dir / f"wspolczynniki_roznic_long_{args.group_mode}_{timestamp}.csv"
-    wide_path = output_dir / f"wspolczynniki_roznic_wide_{args.group_mode}_{timestamp}.csv"
+    output_paths = {}
+    for name, df in value_level_outputs.items():
+        path = output_dir / f"{name}_{timestamp}.csv"
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        output_paths[name] = str(path)
+
+    error_by_location_path = output_dir / f"blad_prognozy_fw_od_2025_08_lokalizacje_{timestamp}.csv"
+    error_overall_path = output_dir / f"blad_prognozy_fw_od_2025_08_ogolem_{timestamp}.csv"
     joined_sample_path = output_dir / f"polaczone_dane_sample_{timestamp}.csv"
     metadata_path = output_dir / f"metadata_{timestamp}.json"
 
-    long_df.to_csv(long_path, index=False, encoding="utf-8-sig")
-    wide_df.to_csv(wide_path, index=False, encoding="utf-8-sig")
+    error_by_location.to_csv(error_by_location_path, index=False, encoding="utf-8-sig")
+    error_overall.to_csv(error_overall_path, index=False, encoding="utf-8-sig")
     joined.head(1000).to_csv(joined_sample_path, index=False, encoding="utf-8-sig")
+
+    if args.legacy_time_groups:
+        long_df, wide_df = build_coefficients(joined, args.group_mode, args.min_count)
+        long_path = output_dir / f"legacy_wspolczynniki_roznic_long_{args.group_mode}_{timestamp}.csv"
+        wide_path = output_dir / f"legacy_wspolczynniki_roznic_wide_{args.group_mode}_{timestamp}.csv"
+        long_df.to_csv(long_path, index=False, encoding="utf-8-sig")
+        wide_df.to_csv(wide_path, index=False, encoding="utf-8-sig")
+        output_paths["legacy_long"] = str(long_path)
+        output_paths["legacy_wide"] = str(wide_path)
 
     metadata = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "args": vars(args),
         "joined_rows": int(len(joined)),
-        "long_rows": int(len(long_df)),
-        "wide_rows": int(len(wide_df)),
+        "error_by_location_rows": int(len(error_by_location)),
+        "error_overall_rows": int(len(error_overall)),
         "outputs": {
-            "long": str(long_path),
-            "wide": str(wide_path),
+            **output_paths,
+            "error_by_location": str(error_by_location_path),
+            "error_overall": str(error_overall_path),
             "joined_sample": str(joined_sample_path),
         },
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Polaczone wiersze: {len(joined)}")
-    print(f"Zapisano long: {long_path}")
-    print(f"Zapisano wide: {wide_path}")
+    for name, path in output_paths.items():
+        print(f"Zapisano {name}: {path}")
+    print(f"Zapisano blad per lokalizacja: {error_by_location_path}")
+    print(f"Zapisano blad ogolem: {error_overall_path}")
     print(f"Zapisano sample danych polaczonych: {joined_sample_path}")
 
 
