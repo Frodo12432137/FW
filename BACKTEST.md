@@ -6,9 +6,21 @@ Ten plik opisuje uruchomienie `backtest_models.py` na mocniejszej maszynie z dos
 
 - pobiera prognozę i wykonanie z SQL albo z plików CSV,
 - buduje te same cechy co obecne modele: rollingi, lagi `diff_lag_*`, miesiąc, godzinę i one-hot lokalizacji,
-- robi chronologiczny walk-forward backtest zamiast losowego `train_test_split`,
-- dla każdego folda trenuje model tylko na przeszłości i testuje na kolejnym oknie,
+- domyślnie robi szybki tryb `fit_all_csv`: trenuje każdy model raz na całym połączonym okresie i generuje gotowy CSV,
+- opcjonalnie robi chronologiczny `walk_forward` backtest zamiast losowego `train_test_split`,
 - zapisuje metryki bazowej prognozy oraz prognozy po korekcie.
+
+## Uruchomienie strzalka
+
+Jesli uruchomisz `backtest_models.py` strzalka w IDE, domyslnie odpali sie szybki tryb:
+
+```text
+mode: fit_all_csv
+epochs: 50
+targets: predkosc, temperatura, kierunek
+```
+
+Ten tryb nie robi kilkunastu foldow. Trenuje kazdy model raz i zapisuje scalony CSV z calego wspolnego okresu SQL.
 
 ## Instalacja
 
@@ -25,6 +37,7 @@ Na Windows musi być zainstalowany ODBC Driver 17 albo 18 for SQL Server. Jeżel
 
 ```bash
 python backtest_models.py ^
+  --mode walk_forward ^
   --start-date "2024-01-01 00:00:00" ^
   --end-date "2026-05-31 23:45:00" ^
   --train-days 365 ^
@@ -42,6 +55,7 @@ Na początku warto puścić krótszą wersję, żeby sprawdzić połączenie, za
 
 ```bash
 python backtest_models.py ^
+  --mode walk_forward ^
   --targets predkosc ^
   --start-date "2025-01-01 00:00:00" ^
   --end-date "2025-04-30 23:45:00" ^

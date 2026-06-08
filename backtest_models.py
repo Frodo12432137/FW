@@ -352,9 +352,11 @@ def normalize_angle(value):
     return (value % 360 + 360) % 360
 
 
-def make_laczenie_like_output(output_dir: Path) -> Path | None:
+def make_laczenie_like_output(output_dir: Path, targets: list[str] | None = None) -> Path | None:
     frames = {}
-    for target_name, cfg in TARGETS.items():
+    target_names = targets if targets is not None else list(TARGETS)
+    for target_name in target_names:
+        cfg = TARGETS[target_name]
         path = output_dir / target_name / "predictions.csv"
         if not path.exists():
             continue
@@ -476,6 +478,59 @@ def train_fold(
 
     test_aligned["pred_diff"] = pred_diff
     return test_aligned, {"train_loss": float(loss.item())}, model, scaler, x_cols
+
+
+def train_and_predict_same_df(
+    df: pd.DataFrame,
+    use_15min: bool,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[pd.DataFrame, dict, NeuralNet, StandardScaler, list[str]]:
+    X, aligned, x_cols = encode_features(df, use_15min=use_15min)
+    y = aligned["diff"].astype(float)
+
+    scaler = StandardScaler()
+    x_np = scaler.fit_transform(X)
+
+    mask = ~np.isnan(x_np).any(axis=1) & ~y.isna().to_numpy()
+    x_np = x_np[mask]
+    y_np = y.to_numpy()[mask]
+    aligned = aligned.iloc[mask].copy()
+
+    if len(x_np) == 0:
+        raise ValueError("Puste dane po odfiltrowaniu NaN.")
+
+    x_t = torch.from_numpy(x_np).float().to(device)
+    y_t = torch.from_numpy(y_np.reshape(-1, 1)).float().to(device)
+
+    model = NeuralNet(input_dim=x_np.shape[1]).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss = None
+
+    model.train()
+    for _ in range(epochs):
+        permutation = torch.randperm(x_t.shape[0], device=device)
+        for start in range(0, x_t.shape[0], batch_size):
+            idx = permutation[start : start + batch_size]
+            outputs = model(x_t[idx])
+            loss = criterion(outputs, y_t[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    pred_parts = []
+    with torch.no_grad():
+        for start in range(0, x_t.shape[0], batch_size):
+            pred_parts.append(model(x_t[start : start + batch_size]).cpu().numpy().reshape(-1))
+
+    aligned["pred_diff"] = np.concatenate(pred_parts)
+    train_loss = float(loss.item()) if loss is not None else math.nan
+    return aligned, {"train_loss": train_loss}, model, scaler, x_cols
 
 
 def metrics(actual: pd.Series, forecast: pd.Series, angular: bool) -> dict[str, float]:
@@ -629,8 +684,108 @@ def run_target(target_name: str, source_prognoza: pd.DataFrame, source_wykonanie
     return summary
 
 
+def run_target_fit_all_csv(
+    target_name: str,
+    source_prognoza: pd.DataFrame,
+    source_wykonanie: pd.DataFrame,
+    args: argparse.Namespace,
+):
+    cfg = TARGETS[target_name]
+    target_dir = Path(args.output_dir) / target_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    df = prepare_dataset(source_prognoza, source_wykonanie, target_name, args.use_15min)
+    if args.max_rows:
+        df = df.sort_values("dataGodzinaCET").tail(args.max_rows).copy()
+
+    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+    start = df["dataGodzinaCET"].min()
+    end = df["dataGodzinaCET"].max()
+    print(f"[{target_name}] fit_all_csv train+predict={start:%Y-%m-%d}->{end:%Y-%m-%d} rows={len(df)}")
+
+    predicted, train_info, model, scaler, x_cols = train_and_predict_same_df(
+        df=df,
+        use_15min=args.use_15min,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        batch_size=args.batch_size,
+        device=device,
+    )
+
+    if cfg["angular"]:
+        predicted[cfg["prediction_col"]] = normalize_angle(predicted[cfg["forecast_col"]] + predicted["pred_diff"])
+    else:
+        predicted[cfg["prediction_col"]] = predicted[cfg["forecast_col"]] + predicted["pred_diff"]
+
+    base = metrics(predicted[cfg["actual_col"]], predicted[cfg["forecast_col"]], cfg["angular"])
+    corr = metrics(predicted[cfg["actual_col"]], predicted[cfg["prediction_col"]], cfg["angular"])
+    result = FoldResult(
+        target=target_name,
+        fold=1,
+        train_start=start,
+        train_end=end,
+        test_start=start,
+        test_end=end,
+        train_rows=len(predicted),
+        test_rows=len(predicted),
+        baseline_mae=base["mae"],
+        corrected_mae=corr["mae"],
+        baseline_rmse=base["rmse"],
+        corrected_rmse=corr["rmse"],
+        baseline_bias=base["bias"],
+        corrected_bias=corr["bias"],
+        improvement_mae_pct=100 * (base["mae"] - corr["mae"]) / base["mae"] if base["mae"] else math.nan,
+        improvement_rmse_pct=100 * (base["rmse"] - corr["rmse"]) / base["rmse"] if base["rmse"] else math.nan,
+    ).__dict__ | train_info
+
+    predicted["target"] = target_name
+    predicted["fold"] = 1
+    keep_cols = [
+        "target",
+        "fold",
+        "dataGodzinaCET",
+        "lokalizacja",
+        cfg["forecast_col"],
+        cfg["actual_col"],
+        "pred_diff",
+        cfg["prediction_col"],
+    ]
+    metrics_df = pd.DataFrame([result])
+    predictions_df = predicted[keep_cols].copy()
+    metrics_df.to_csv(target_dir / "metrics_by_fold.csv", index=False)
+    predictions_df.to_csv(target_dir / "predictions.csv", index=False)
+
+    fold_dir = target_dir / "fit_all"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), fold_dir / "model.pth")
+    joblib.dump(scaler, fold_dir / "scaler.joblib")
+    (fold_dir / "features.json").write_text(json.dumps({"x_cols": x_cols}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary = {
+        "target": target_name,
+        "mode": "fit_all_csv",
+        "rows": int(len(df)),
+        "folds": 1,
+        "baseline_mae_mean": result["baseline_mae"],
+        "corrected_mae_mean": result["corrected_mae"],
+        "baseline_rmse_mean": result["baseline_rmse"],
+        "corrected_rmse_mean": result["corrected_rmse"],
+        "improvement_mae_pct_mean": result["improvement_mae_pct"],
+        "improvement_rmse_pct_mean": result["improvement_rmse_pct"],
+    }
+    (target_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Chronologiczny backtest modeli korekty pogody.")
+    parser.add_argument(
+        "--mode",
+        choices=["fit_all_csv", "walk_forward"],
+        default="fit_all_csv",
+        help="fit_all_csv robi szybki CSV z calego okresu SQL; walk_forward robi pelny backtest z wieloma foldami.",
+    )
     parser.add_argument("--targets", nargs="+", default=["predkosc", "temperatura", "kierunek"], choices=sorted(TARGETS))
     parser.add_argument("--start-date", default=None, help="Np. 2024-01-01 00:00:00. Podmienia @start_date w SQL.")
     parser.add_argument("--end-date", default=None, help="Np. 2026-05-31 23:45:00. Podmienia @end_date w SQL.")
@@ -646,7 +801,7 @@ def parse_args():
     parser.add_argument("--test-days", type=int, default=30)
     parser.add_argument("--step-days", type=int, default=30)
     parser.add_argument("--min-train-rows", type=int, default=5000)
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.009)
     parser.add_argument("--weight-decay", type=float, default=0.0001)
     parser.add_argument("--batch-size", type=int, default=8192)
@@ -666,11 +821,14 @@ def main():
     started_at = datetime.now().isoformat(timespec="seconds")
 
     for target in args.targets:
-        summaries.append(run_target(target, prognoza, wykonanie, args))
+        if args.mode == "walk_forward":
+            summaries.append(run_target(target, prognoza, wykonanie, args))
+        else:
+            summaries.append(run_target_fit_all_csv(target, prognoza, wykonanie, args))
 
     summary_df = pd.DataFrame(summaries)
     summary_df.to_csv(Path(args.output_dir) / "summary.csv", index=False)
-    laczenie_like_path = make_laczenie_like_output(Path(args.output_dir))
+    laczenie_like_path = make_laczenie_like_output(Path(args.output_dir), targets=args.targets)
     run_meta = {
         "started_at": started_at,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
